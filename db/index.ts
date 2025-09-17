@@ -125,6 +125,82 @@ export async function findMessageById(chatId: number, msgId: number) {
 
 /* =====  message stats  ===== */
 
+export async function getWeekStats(chatId: number): Promise<MessageStats> {
+  const c = await getMessagesColl();
+
+  // Получаем начало и конец периода (7 дней)
+  const weekAgo = new Date();
+  weekAgo.setHours(0, 0, 0, 0);
+  weekAgo.setDate(weekAgo.getDate() - 7);
+  const tomorrow = new Date();
+  tomorrow.setHours(0, 0, 0, 0);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  // Получаем все сообщения за последние 7 дней
+  const messages = await c
+    .find({
+      chatId,
+      date: {
+        $gte: weekAgo,
+        $lt: tomorrow,
+      },
+    })
+    .toArray();
+
+  // Инициализируем статистику
+  const stats: MessageStats = {
+    totalMessages: 0,
+    stickers: 0,
+    gifs: 0,
+    photos: 0,
+    videos: 0,
+    userStats: [],
+  };
+
+  // Счетчик сообщений по пользователям
+  const userCounts = new Map<number, { userName: string; count: number }>();
+
+  // Обрабатываем каждое сообщение
+  for (const msg of messages) {
+    stats.totalMessages++;
+
+    // Определяем тип сообщения
+    if (msg.raw.sticker) {
+      stats.stickers++;
+    } else if (msg.raw.animation) {
+      stats.gifs++;
+    } else if (msg.raw.photo) {
+      stats.photos++;
+    } else if (msg.raw.video) {
+      stats.videos++;
+    }
+
+    // Считаем сообщения по пользователям
+    if (msg.fromId && msg.authorName) {
+      const existing = userCounts.get(msg.fromId);
+      if (existing) {
+        existing.count++;
+      } else {
+        userCounts.set(msg.fromId, {
+          userName: msg.authorName,
+          count: 1,
+        });
+      }
+    }
+  }
+
+  // Преобразуем Map в массив и сортируем
+  stats.userStats = Array.from(userCounts.entries())
+    .map(([userId, data]) => ({
+      userId,
+      userName: data.userName,
+      messageCount: data.count,
+    }))
+    .sort((a, b) => b.messageCount - a.messageCount);
+
+  return stats;
+}
+
 export async function getTodayStats(chatId: number): Promise<MessageStats> {
   const c = await getMessagesColl();
 
