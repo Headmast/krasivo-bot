@@ -16,6 +16,7 @@ import {
   getWeekStats,
 } from "../db";
 import { openai } from "../utils/openai";
+import { telegramClient } from "../utils/mtproto";
 
 export default function supergroupHandler(bot: TelegramBot) {
   bot.on("message", async (msg: Message) => {
@@ -109,7 +110,7 @@ export default function supergroupHandler(bot: TelegramBot) {
         // Отправляем сообщение о начале сбора данных
         let statusMessage = await bot.sendMessage(
           msg.chat.id, 
-          "🔍 Собираю информацию об активных пользователях (анализирую последние 400 сообщений)...",
+          "🔍 Собираю информацию об активных пользователях через MTProto API...",
           { reply_to_message_id: msg.message_id }
         );
         
@@ -119,28 +120,51 @@ export default function supergroupHandler(bot: TelegramBot) {
         // Получаем список участников чата через API
         const chatMemberCount = await bot.getChatMemberCount(msg.chat.id);
         
+        // Получаем администраторов чата
+        const admins = await bot.getChatAdministrators(msg.chat.id);
+        
         // Создаем список активных пользователей
         const activeUsers: { id: number, name: string, messageCount: number }[] = [];
         
-        // Получаем последние 400 сообщений вручную
-        // Для этого будем использовать метод getUpdates и фильтровать сообщения по чату
-        // Создаем временный массив для хранения сообщений
-        const messages: Message[] = [];
+        // Собираем ID пользователей из администраторов и текущего пользователя
+        const userIds: number[] = [];
         
-        // Добавляем текущее сообщение
-        messages.push(msg);
-        
-        // Если есть ответ на сообщение, добавляем его
-        if (msg.reply_to_message) {
-          messages.push(msg.reply_to_message);
+        // Добавляем администраторов
+        for (const admin of admins) {
+          if (!admin.user.is_bot) {
+            userIds.push(admin.user.id);
+            activeUsers.push({
+              id: admin.user.id,
+              name: admin.user.first_name + (admin.user.last_name ? ` ${admin.user.last_name}` : ''),
+              messageCount: 0 // Заполним позже из MTProto API
+            });
+          }
         }
         
-        // Получаем историю сообщений из базы данных, если она доступна
+        // Добавляем текущего пользователя, если он еще не в списке
+        if (msg.from && !msg.from.is_bot && !userIds.includes(msg.from.id)) {
+          userIds.push(msg.from.id);
+          activeUsers.push({
+            id: msg.from.id,
+            name: msg.from.first_name + (msg.from.last_name ? ` ${msg.from.last_name}` : ''),
+            messageCount: 0 // Заполним позже из MTProto API
+          });
+        }
+        
+        // Получаем историю сообщений из базы данных для сбора ID пользователей
         try {
-          const history = await getChatHistory(msg.chat.id, 400);
+          const history = await getChatHistory(msg.chat.id, 100);
           for (const historyMsg of history) {
-            if (historyMsg.raw) {
-              messages.push(historyMsg.raw);
+            if (historyMsg.raw && historyMsg.raw.from && 
+                !historyMsg.raw.from.is_bot && 
+                !userIds.includes(historyMsg.raw.from.id)) {
+              
+              userIds.push(historyMsg.raw.from.id);
+              activeUsers.push({
+                id: historyMsg.raw.from.id,
+                name: historyMsg.raw.from.first_name + (historyMsg.raw.from.last_name ? ` ${historyMsg.raw.from.last_name}` : ''),
+                messageCount: 0 // Заполним позже из MTProto API
+              });
             }
           }
         } catch (dbErr) {
@@ -148,35 +172,53 @@ export default function supergroupHandler(bot: TelegramBot) {
           // Продолжаем работу с тем, что есть
         }
         
-        // Обрабатываем полученные сообщения
-        const processedUserIds = new Set<number>();
-        
-        for (const message of messages) {
-          if (message.from && !message.from.is_bot && !processedUserIds.has(message.from.id)) {
-            // Подсчитываем количество сообщений от этого пользователя
-            const userMessages = messages.filter(m => m.from && m.from.id === message.from!.id);
-            
-            activeUsers.push({
-              id: message.from.id,
-              name: message.from.first_name + (message.from.last_name ? ` ${message.from.last_name}` : ''),
-              messageCount: userMessages.length
-            });
-            
-            processedUserIds.add(message.from.id);
+        // Получаем количество сообщений для каждого пользователя через MTProto API
+        try {
+          // Обновляем статус
+          await bot.editMessageText(
+            "🔍 Получаю статистику сообщений через MTProto API...",
+            { chat_id: msg.chat.id, message_id: statusMessage.message_id }
+          );
+          
+          // Получаем счетчики сообщений через MTProto API
+          console.log("Получаем счетчики сообщений через MTProto API:", msg.chat.id.toString());
+          console.log("Получаем userIds", userIds);
+          const messageCounters = await telegramClient.getMessageCounters(
+            Number(msg.chat.id.toString()), // Преобразуем ID чата в формат без префикса
+            userIds
+          );
+          console.log("Получаем messageCounters", messageCounters);
+          // Обновляем количество сообщений у пользователей
+          for (const user of activeUsers) {
+            if (messageCounters[user.id]) {
+              user.messageCount = messageCounters[user.id];
+            }
           }
-        }
-        
-        // Получаем администраторов чата и добавляем их, если они еще не в списке
-        const admins = await bot.getChatAdministrators(msg.chat.id);
-        for (const admin of admins) {
-          if (!admin.user.is_bot && !processedUserIds.has(admin.user.id)) {
-            activeUsers.push({
-              id: admin.user.id,
-              name: admin.user.first_name + (admin.user.last_name ? ` ${admin.user.last_name}` : ''),
-              messageCount: 1 // Минимальное значение для администраторов
-            });
+        } catch (apiErr) {
+          console.error("Ошибка при получении данных через MTProto API:", apiErr);
+          // Если не удалось получить данные через API, используем данные из базы
+          await bot.editMessageText(
+            "⚠️ Не удалось получить данные через MTProto API, использую локальную базу данных...",
+            { chat_id: msg.chat.id, message_id: statusMessage.message_id }
+          );
+          
+          // Получаем сообщения из базы данных
+          const messages: Message[] = [];
+          try {
+            const history = await getChatHistory(msg.chat.id, 400);
+            for (const historyMsg of history) {
+              if (historyMsg.raw) {
+                messages.push(historyMsg.raw);
+              }
+            }
             
-            processedUserIds.add(admin.user.id);
+            // Подсчитываем сообщения для каждого пользователя
+            for (const user of activeUsers) {
+              const userMessages = messages.filter(m => m.from && m.from.id === user.id);
+              user.messageCount = userMessages.length;
+            }
+          } catch (dbErr) {
+            console.error("Ошибка при получении истории из БД:", dbErr);
           }
         }
         
@@ -184,18 +226,18 @@ export default function supergroupHandler(bot: TelegramBot) {
         activeUsers.sort((a, b) => b.messageCount - a.messageCount);
         
         // Формируем текст с активными пользователями
-        let responseText = "👥 Активные пользователи в чате (на основе анализа последних сообщений):\n\n";
+        let responseText = "👥 Активные пользователи в чате (через MTProto API):\n\n";
         
         if (activeUsers.length === 0) {
           responseText += "Не удалось определить активных пользователей 😴";
         } else {
           activeUsers.forEach((user, index) => {
-            responseText += `${index + 1}. ${user.name}: ${user.messageCount} сообщений\n`;
+            const medal = index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : "🏅";
+            responseText += `${medal} ${user.name}: ${user.messageCount} сообщений\n`;
           });
           
           responseText += `\nВсего активных пользователей: ${activeUsers.length}`;
           responseText += `\nВсего участников в чате: ${chatMemberCount}`;
-          responseText += `\nПроанализировано сообщений: ${messages.length}`;
         }
         
         // Отправляем результат

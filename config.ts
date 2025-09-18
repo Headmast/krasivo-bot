@@ -4,6 +4,12 @@ import { BotSettings, getSettings, updateSettings } from "./db";
 /* —— единый TTL для всех кэшей — */
 const CACHE_TTL_MS = 60_000;
 
+/* —— Telegram API credentials — */
+export const config = {
+  telegram_api_id: Number(process.env.TELEGRAM_API_ID || 0),
+  telegram_api_hash: process.env.TELEGRAM_API_HASH || '',
+};
+
 /* —— model (как раньше) — */
 let cachedModel         = process.env.MODEL ?? "gemma-3-12b-it";
 let modelExpires        = 0;
