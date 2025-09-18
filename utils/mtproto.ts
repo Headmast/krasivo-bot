@@ -2,416 +2,291 @@
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import readline from "readline";
-import { config } from "../config";
 import fs from "fs";
 import path from "path";
+import { config } from "../config";
 
 // Путь к файлу сессии
 const SESSION_FILE = process.env.TG_SESSION_FILE || path.resolve(process.cwd(), ".telegram.session");
 
-// Улучшенная функция чтения с проверками:
+// Чтение сохранённой строки сессии
 function readSessionFromFile(): string {
   try {
-    if (!fs.existsSync(SESSION_FILE)) {
-      console.log(`Файл сессии не найден: ${SESSION_FILE}`);
-      return "";
-    }
-    
-    const stats = fs.statSync(SESSION_FILE);
-    if (stats.size === 0) {
-      console.log("Файл сессии пустой, требуется новая авторизация");
-      return "";
-    }
-    
-    const session = fs.readFileSync(SESSION_FILE, "utf8").trim();
-    console.log(`Прочитана сессия: ${session.length} символов`);
-    return session;
+    if (!fs.existsSync(SESSION_FILE)) return "";
+    const data = fs.readFileSync(SESSION_FILE, "utf8").trim();
+    console.log(`Прочитана сессия: ${data.length} символов`);
+    return data;
   } catch (e) {
     console.error("Ошибка чтения файла сессии:", e);
     return "";
   }
 }
 
+// Запись строки сессии на диск
 function writeSessionToFile(session: string) {
   try {
-    if (!session || session.trim() === "") {
-      console.warn("Попытка сохранить пустую сессию, пропускаем");
+    if (!session) {
+      console.warn("Пустая сессия, ничего не сохраняем");
       return;
     }
-    
-    // Убедимся, что директория существует
     const dir = path.dirname(SESSION_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(SESSION_FILE, session, "utf8");
     console.log(`Сессия сохранена: ${SESSION_FILE} (${session.length} символов)`);
-    
-    // Проверка, что файл действительно записался
-    const verification = fs.readFileSync(SESSION_FILE, "utf8").trim();
-    if (verification !== session) {
-      console.error("ОШИБКА: записанная сессия не совпадает с исходной!");
-    }
   } catch (e) {
-    console.warn("Не удалось сохранить сессию на диск:", e);
+    console.error("Не удалось сохранить сессию:", e);
   }
 }
 
-// Утилита для интерактивных вопросов
+// Вопросы в консоли
 function ask(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
+  return new Promise((res) => rl.question(question, (ans) => { rl.close(); res(ans.trim()); }));
 }
 
 export class TGClient {
   private client: TelegramClient;
   private isConnected = false;
-  private entityCache = new Map<string, any>(); // локальный кэш для минимизации повторных запросов
+  private entityCache = new Map<string, any>();
 
   constructor() {
-    //const stringSession = new StringSession(process.env.TG_STRING_SESSION ?? "");
-    const initialSession = readSessionFromFile(); 
-    console.log("Прочитана сессия из файла:", initialSession ? "найдена" : "пустая"); 
+    const initial = readSessionFromFile();
     this.client = new TelegramClient(
-      new StringSession(initialSession),
+      new StringSession(initial),
       Number(config.telegram_api_id),
       String(config.telegram_api_hash),
-      {
-        deviceModel: "bun-ts",
-        appVersion: "1.0.0",
-        systemVersion: "linux",
-        connectionRetries: 5,
-      }
+      { deviceModel: "bun-ts", appVersion: "1.0.0", systemVersion: "linux", connectionRetries: 5 }
     );
-
-    // Автосохранение при любых изменениях сессии (если поддерживается)
-    const originalSave = this.client.session.save.bind(this.client.session);
+    // Автосохраняем при любых изменениях
+    const saveOrig = this.client.session.save.bind(this.client.session);
     this.client.session.save = () => {
-      const result = originalSave();
-      if (result && result !== readSessionFromFile()) {
-        writeSessionToFile(result);
-        console.log("Автосохранение сессии при изменении");
-      }
-      return result;
+      const s = saveOrig();
+      writeSessionToFile(s);
+      return s;
     };
-  }
-
-  // Проверка, нужна ли повторная авторизация
-  async isSessionValid(): Promise<boolean> {
-    try {
-      await this.client.connect();
-      await this.client.getMe(); // если сессия невалидна — упадёт здесь
-      return true;
-    } catch (e) {
-      console.log("Сессия невалидна, требуется повторная авторизация:", e);
-      return false;
-    }
   }
 
   // Подключение и авторизация
   async connect() {
     if (this.isConnected) return;
     try {
-      await this.client.connect(); // если сессия сохранена — достаточно connect() [attached_file:1]
+      await this.client.connect();
       const me = await this.client.getMe();
-      console.log("Успешно подключились к Telegram API как:", (me as any)?.username ?? (me as any)?.id);
-      // ВАЖНО: сохраняем сессию после успешного connect(), так как она могла обновиться
-      const currentSession = this.client.session.save();
-      if (currentSession !== readSessionFromFile()) { // избегаем лишней записи, если не изменилась
-        writeSessionToFile(currentSession);
-        console.log("Сессия обновлена и сохранена после connect()");
-      }
+      console.log("Подключились как:", (me as any)?.username ?? (me as any)?.id);
+      // Сохраняем после возможных обновлений
+      const cur = this.client.session.save();
       this.isConnected = true;
       return me;
     } catch {
-      console.log("Требуется авторизация в Telegram API");
-      await this.startAuthentication(); // интерактивный логин [attached_file:1]
+      console.log("Нужна авторизация");
+      await this.startAuth();
       this.isConnected = true;
     }
   }
 
-  private async startAuthentication() {
+  private async startAuth() {
     await this.client.start({
-      phoneNumber: async () => await ask("Введите номер телефона (+7...): "),
-      password: async () => await ask("Введите пароль двухфакторной аутентификации (если включён): "),
-      phoneCode: async () => await ask("Введите код из Telegram: "),
-      onError: (err) => console.error("Auth error:", err),
+      phoneNumber: async () => await ask("Телефон (+7...): "),
+      password: async () => await ask("2FA пароль (если есть): "),
+      phoneCode: async () => await ask("Код из Telegram: "),
+      onError: (e) => console.error("Auth error:", e),
     });
-    const saved = this.client.session.save();
-    writeSessionToFile(saved);                                       // <-- сохраняем на диск
-    console.log("String session обновлена и сохранена на диск.");
-    // const saved = this.client.session.save();
-    // console.log("String session (сохраните в переменную окружения TG_STRING_SESSION):\n", saved); // [attached_file:1]
+    console.log("Авторизация завершена");
   }
 
-  // Минимальный прогрев кэша: только 10 последних диалогов для снижения FLOOD_WAIT [web:58][web:61]
-  private async warmUpMinimal() {
-    const cacheKey = "dialogs_warmed";
-    if (this.entityCache.has(cacheKey)) return; // уже прогрели
-
+  // Минимальный прогрев диалогов (limit=10)
+  private async warmUp() {
+    const key = "dialogs";
+    if (this.entityCache.has(key)) return;
     try {
-      console.log("Прогрев минимального кэша диалогов...");
-      const dialogs = await this.client.getDialogs({ limit: 100 }); // только 10 последних диалогов [web:58][web:61]
-      this.entityCache.set(cacheKey, true);
-      console.log(`Прогрето ${dialogs.length} диалогов для кэша сущностей`);
+      console.log("Прогрев диалогов...");
+      const dlg = await this.client.getDialogs({ limit: 10 });
+      console.log(`Прогрето диалогов: ${dlg.length}`);
     } catch (e) {
       console.warn("Не удалось прогреть диалоги:", e);
     }
+    this.entityCache.set(key, true);
   }
 
-  // Безопасное получение InputPeer для чата
-  private async resolveChatPeer(chatIdOrName: string | number): Promise<Api.TypeInputPeer> {
-    const cacheKey = `chat_${chatIdOrName}`;
-    if (this.entityCache.has(cacheKey)) {
-      return this.entityCache.get(cacheKey);
+  // Разрешение peer любого типа
+  private async resolvePeer(chat: string | number): Promise<Api.TypeInputPeer> {
+    const key = `peer_${chat}`;
+    if (this.entityCache.has(key)) return this.entityCache.get(key);
+
+    // строка (@username или ссылка)
+    if (typeof chat === "string") {
+      const ent = await this.client.getInputEntity(chat);
+      this.entityCache.set(key, ent);
+      return ent;
     }
 
-    // 1) Если строка — пробуем напрямую (самый надёжный путь)
-    if (typeof chatIdOrName === "string") {
+    await this.warmUp();
+    const id = Number(chat);
+    if (id.toString().startsWith("-100")) {
+      const abs = Math.abs(id);
       try {
-        const entity = (await this.client.getInputEntity(chatIdOrName)) as Api.TypeInputPeer; // [web:43]
-        this.entityCache.set(cacheKey, entity);
-        return entity;
-      } catch (e) {
-        throw new Error(`Не удалось резолвить чат по строке "${chatIdOrName}": ${e}`);
-      }
-    }
-
-    // 2) Числовые ID
-    const idNum = Number(chatIdOrName);
-    if (Number.isNaN(idNum)) throw new Error("Некорректный идентификатор чата");
-
-    // 2.1) Канал/супергруппа (-100...)
-    if (idNum.toString().startsWith("-100")) {
-      const absId = Math.abs(idNum);
-      await this.warmUpMinimal(); // минимальный прогрев [web:58]
-      try {
-        const entity = (await this.client.getInputEntity(absId)) as Api.InputPeerChannel; // [web:43]
-        this.entityCache.set(cacheKey, entity);
-        return entity;
+        const ent = await this.client.getInputEntity(abs) as Api.InputPeerChannel;
+        this.entityCache.set(key, ent);
+        return ent;
       } catch {
-        throw new Error("Не удалось резолвить канал по ID. Нужен username/ссылка '@name' или 'https://t.me/name'.");
+        throw new Error("Нужен @username канала");
       }
     }
-
-    // 2.2) Обычная группа (<0, не -100...)
-    if (idNum < 0) {
-      const groupId = -idNum;
-      await this.warmUpMinimal(); // минимальный прогрев [web:58]
-      const entity = (await this.client.getInputEntity(groupId)) as Api.InputPeerChat; // [web:43]
-      this.entityCache.set(cacheKey, entity);
-      return entity;
+    if (id < 0) {
+      const ent = await this.client.getInputEntity(-id) as Api.InputPeerChat;
+      this.entityCache.set(key, ent);
+      return ent;
     }
-
-    // 2.3) Личный чат (>0)
-    await this.warmUpMinimal(); // минимальный прогрев [web:58]
-    try {
-      const entity = (await this.client.getInputEntity(idNum)) as Api.InputPeerUser; // [web:43]
-      this.entityCache.set(cacheKey, entity);
-      return entity;
-    } catch {
-      throw new Error("Не удалось резолвить пользователя по ID. Нужен username/ссылка.");
-    }
+    const ent = await this.client.getInputEntity(id) as Api.InputPeerUser;
+    this.entityCache.set(key, ent);
+    return ent;
   }
 
-  // Получение участников канала с ограничением для снижения FLOOD_WAIT [web:59][web:62]
-  private async getChatParticipants(
-    chatPeer: Api.InputPeerChannel,
-    searchQuery = "",
+  // Получение последних сообщений и сбор пользователей
+  private async loadHistoryUsers(
+    peer: Api.TypeInputPeer,
     limit = 100
-  ): Promise<Array<Api.User>> {
-    const cacheKey = `participants_${chatPeer.channelId}_${searchQuery}_${limit}`;
-    if (this.entityCache.has(cacheKey)) {
-      return this.entityCache.get(cacheKey);
-    }
-
-    try {
-      const result = await this.client.invoke(
-        new Api.channels.GetParticipants({
-          channel: chatPeer,
-          filter: searchQuery 
-            ? new Api.ChannelParticipantsSearch({ q: searchQuery }) 
-            : new Api.ChannelParticipantsRecent({}), // только последние активные [web:62]
-          offset: 0,
-          limit: Math.min(limit, 100), // не больше 100, чтобы минимизировать FLOOD_WAIT [web:59][web:62]
-          hash: 0n,
-        })
-      );
-      const users = (result as any).users as Array<Api.User>;
-      this.entityCache.set(cacheKey, users || []);
-      return users || [];
-    } catch (e) {
-      console.warn("Не удалось получить участников:", e);
-      return [];
-    }
-  }
-
-  // Поиск InputPeerUser среди участников чата
-  private async resolveUserFromChat(
-    chatPeer: Api.InputPeerChannel,
-    user: string | number
-  ): Promise<Api.InputPeerUser | null> {
-    // 1) Если строка — сначала прямой резолв
-    if (typeof user === "string") {
-      try {
-        return (await this.client.getInputEntity(user)) as Api.InputPeerUser; // [web:43]
-      } catch {
-        // перейдём к поиску в участниках
-      }
-    }
-
-    // 2) Поиск в участниках канала
-    const searchQ = typeof user === "string" ? user.replace("@", "") : "";
-    const participants = await this.getChatParticipants(chatPeer, searchQ, 100); // [web:59][web:62]
-
-    if (typeof user === "number") {
-      const found = participants.find(u => Number(u.id) === Number(user));
-      if (found && "accessHash" in found) {
-        return new Api.InputPeerUser({ 
-          userId: found.id as any, 
-          accessHash: (found as any).accessHash as any 
-        });
-      }
-    } else if (participants.length > 0) {
-      const found = participants[0];
-      if (found && "accessHash" in found) {
-        return new Api.InputPeerUser({ 
-          userId: found.id as any, 
-          accessHash: (found as any).accessHash as any 
-        });
-      }
-    }
-
-    return null;
-  }
-
-  // Получение последних 100 сообщений из чата [web:63][web:71]
-  async getRecentMessages(chatIdOrName: string | number, limit = 100) {
-    await this.connect();
-    
-    const peer = await this.resolveChatPeer(chatIdOrName);
-    
+  ): Promise<Map<string, Api.User>> {
     const result = await this.client.invoke(
       new Api.messages.GetHistory({
         peer,
         offsetId: 0,
         offsetDate: 0,
         addOffset: 0,
-        limit: Math.min(limit, 100), // не больше 100 за раз [web:63][web:71]
+        limit: Math.min(limit, 100),
         maxId: 0,
         minId: 0,
-        hash: 0n, // BigInt обязателен [web:63][web:69]
+        hash: 0n,
       })
     );
-
-    let messages: Api.Message[] = [];
-    if (result instanceof Api.messages.Messages || result instanceof Api.messages.MessagesSlice) {
-      messages = result.messages as Api.Message[];
-    } else if (result instanceof Api.messages.ChannelMessages) {
-      messages = result.messages as Api.Message[];
-    }
-
-    return messages;
+    const users = ((result as any).users as Api.User[]) || [];
+    const map = new Map<string, Api.User>();
+    for (const u of users) map.set(String(u.id), u);
+    return map;
   }
 
-  // Подсчёт сообщений пользователей в чате за последние сутки [web:12][web:9]
+  // Подсчёт за последние сутки
   async getMessageCounters(
-    chatIdOrName: string | number, 
-    userIdsOrNames: Array<string | number>
+    chat: string | number,
+    users: Array<string | number>
   ): Promise<Record<string, number>> {
     await this.connect();
+    const peer = await this.resolvePeer(chat);
+    // Определяем тип чата (channel vs chat)
+    let isChannel = peer instanceof Api.InputPeerChannel;
 
-    console.log("Обрабатываем чат:", chatIdOrName);
+    // Если канал — можно получить права через channels.GetFullChannel
+    if (isChannel) {
+      try {
+        const full = await this.client.invoke(
+          new Api.channels.GetFullChannel({ channel: peer as Api.InputPeerChannel })
+        );
+        console.log("Админ права:", (full.fullChat as any)?.adminRights);
+      } catch {
+        // ignore
+      }
+    }
 
-    const peer = await this.resolveChatPeer(chatIdOrName);
+    // Загружаем историю для сбора access_hash пользователей
+    const userMap = await this.loadHistoryUsers(peer);
 
-    // Временные границы: последние 24 часа
-    const nowSec = Math.floor(Date.now() / 1000);
-    const dayAgoSec = nowSec - 24 * 60 * 60;
-
+    const now = Math.floor(Date.now() / 1000);
+    const dayAgo = now - 24 * 60 * 60;
     const result: Record<string, number> = {};
 
-    for (const u of userIdsOrNames) {
+    for (const u of users) {
       let fromPeer: Api.InputPeerUser | null = null;
 
-      // Пытаемся получить InputPeerUser
       if (typeof u === "string") {
         try {
-          fromPeer = (await this.client.getInputEntity(u)) as Api.InputPeerUser; // [web:43]
+          fromPeer = await this.client.getInputEntity(u) as Api.InputPeerUser;
         } catch {
-          // fallback на поиск в участниках
-          if (peer instanceof Api.InputPeerChannel) {
-            fromPeer = await this.resolveUserFromChat(peer, u); // [web:62]
-          }
+          const usr = userMap.get(u.replace("@", ""));
+          if (usr) fromPeer = new Api.InputPeerUser({ userId: usr.id as any, accessHash: (usr as any).accessHash as any });
         }
       } else {
-        if (peer instanceof Api.InputPeerChannel) {
-          fromPeer = await this.resolveUserFromChat(peer, u); // [web:62]
-        }
+        const usr = userMap.get(String(u));
+        if (usr) fromPeer = new Api.InputPeerUser({ userId: usr.id as any, accessHash: (usr as any).accessHash as any });
       }
 
       if (!fromPeer) {
-        console.warn(`Не удалось резолвить отправителя ${u}: пропускаем`);
+        console.warn(`Не удалось резолвить ${u}, пропускаем`);
         result[String(u)] = 0;
         continue;
       }
 
-      // Поиск сообщений за сутки с точным count [web:12][web:9]
       const search = await this.client.invoke(
         new Api.messages.Search({
           peer,
           q: "",
           fromId: fromPeer,
           filter: new Api.InputMessagesFilterEmpty({}),
-          minDate: dayAgoSec,   // только за сутки [web:12]
-          maxDate: nowSec,      // по текущий момент [web:12]
+          minDate: dayAgo,
+          maxDate: now,
           offsetId: 0,
           addOffset: 0,
-          limit: 1,             // минимальный лимит, count вернётся отдельно [web:12]
+          limit: 1,
           maxId: 0,
           minId: 0,
-          hash: 0n,             // BigInt обязателен [web:9][web:12]
+          hash: 0n,
         })
       );
 
-      let total = 0;
-      if (search instanceof Api.messages.MessagesNotModified) {
-        total = search.count;
-      } else if (search instanceof Api.messages.Messages) {
-        total = (search as any).count ?? search.messages.length;
-      } else if (search instanceof Api.messages.MessagesSlice) {
-        total = search.count; // точное число найденных сообщений [web:12]
-      }
+      let count = 0;
+      if (search instanceof Api.messages.MessagesNotModified) count = search.count;
+      else if (search instanceof Api.messages.Messages) count = (search as any).count ?? search.messages.length;
+      else if (search instanceof Api.messages.MessagesSlice) count = search.count;
 
-      result[String(u)] = total;
+      result[String(u)] = count;
     }
 
     return result;
   }
 
-  // Аналог resolveChannel для совместимости
-  async resolveChannel(channelIdOrName: string | number) {
-    const peer = await this.resolveChatPeer(channelIdOrName);
-    if (!(peer instanceof Api.InputPeerChannel)) {
-      throw new Error("Не канал/супергруппа");
-    }
-
-    const full = await this.client.invoke(
-      new Api.channels.GetFullChannel({ channel: peer })
+  // Получить последние сообщения
+  async getRecentMessages(chat: string | number, limit = 100) {
+    await this.connect();
+    const peer = await this.resolvePeer(chat);
+    const res = await this.client.invoke(
+      new Api.messages.GetHistory({
+        peer,
+        offsetId: 0,
+        offsetDate: 0,
+        addOffset: 0,
+        limit: Math.min(limit, 100),
+        maxId: 0,
+        minId: 0,
+        hash: 0n,
+      })
     );
-    
-    console.log("Канал найден:", (full.fullChat as any)?.about ?? (full.chats?.[0] as any)?.title ?? channelIdOrName);
-    return full;
+    if (res instanceof Api.messages.Messages || res instanceof Api.messages.MessagesSlice) {
+      return res.messages as Api.Message[];
+    }
+    if (res instanceof Api.messages.ChannelMessages) {
+      return res.messages as Api.Message[];
+    }
+    return [];
   }
 
-  // Получение информации о себе
+  // Информация о канале или группе
+  async resolveChannel(chat: string | number) {
+    await this.connect();
+    const peer = await this.resolvePeer(chat);
+    if (peer instanceof Api.InputPeerChannel) {
+      const full = await this.client.invoke(new Api.channels.GetFullChannel({ channel: peer }));
+      return full;
+    } else {
+      // обычная группа
+      const full = await this.client.invoke(new Api.messages.GetFullChat({ chatId: (peer as Api.InputPeerChat).chatId }));
+      return full;
+    }
+  }
+
   async getMe() {
     await this.connect();
     return await this.client.getMe();
   }
 
-  // Отключение
   async disconnect() {
     if (this.isConnected) {
       await this.client.disconnect();
@@ -420,5 +295,4 @@ export class TGClient {
   }
 }
 
-// Экспорт для совместимости с прежним кодом
 export const telegramClient = new TGClient();
