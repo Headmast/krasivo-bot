@@ -1,5 +1,7 @@
 {
   "compilerOptions": {
+    "sourceMap": true,
+    "inlineSources": true,
     "noImplicitAny": false,
     // Enable latest features
     "lib": ["ESNext", "DOM"],
